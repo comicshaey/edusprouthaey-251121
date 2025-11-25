@@ -5,6 +5,36 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>방학중 비상시근로자 방학근무 인건비 계산기 (주휴수당)</title>
   <link rel="stylesheet" href="/static/style.css" />
+
+
+  <style>
+    .result-grid{
+      display:flex;
+      flex-direction:column;
+      gap:8px;
+    }
+    .result-item{
+      display:flex;
+      align-items:baseline;
+      gap:8px;
+      flex-wrap:wrap;
+    }
+    .result-item-wide{
+      display:flex;
+      align-items:baseline;
+      gap:8px;
+      flex-wrap:wrap;
+    }
+    .result-label{
+      font-weight:700;
+      min-width:200px;
+    }
+    .result-value,
+    .result-total{
+      margin-left:auto;
+      text-align:right;
+    }
+  </style>
 </head>
 <body>
 
@@ -17,7 +47,7 @@
 
       <p class="muted"> 
         ·조리종사원 급식소 청소 인건비 및 청소원 방학중 근무 일할계산 급여 계산기 <br/>
-        ·산업안전보건교육 인건비는 별도 <br/>
+        ·산업안전보건교육 인건비 계산기는 별도 페이지에 있음 <br/>
       </p>
     </div>
   </header>
@@ -52,13 +82,13 @@
           <option value="cook-helper">교육공무직 (조리실무사)</option>
           <option value="cleaner">특수운영직군 (청소원)</option>
         </select>
-<p class="muted"> 교육공무직 업무 편람 참고함. </p>
+        <p class="muted"> 교육공무직 업무 편람 참고함. </p>
       </div>
     </section>
 
     
 
-<section class="card">
+    <section class="card">
       <!-- 근무 기간 -->
       <div class="grid two">
         <div class="form-row">
@@ -122,11 +152,15 @@
       </div>
     </section>
 
-    <!-- 자동 계산 결과 -->
+    <!-- 인건비 계산 버튼 + 결과 -->
     <section class="card">
+      <div class="form-row" style="text-align:right; margin-bottom:8px;">
+        <button type="button" class="btn" id="calcBtn">계산하기</button>
+      </div>
+
       <h2> 인건비 소요액 계산 내역</h2>
       <p class="hint">
-        입력시 자동계산된 결과
+        계산하기 버튼을 누르면 아래 항목별로 인건비를 계산해서 보여줍니다.
       </p>
 
       <div class="result-grid">
@@ -138,36 +172,47 @@
         <div class="result-item">
           <div class="result-label">주간 실근로시간</div>
           <div class="result-value" id="weeklyHoursText">-</div>
-          <div class="result-sub" id="weeklyHoursHintText">
+        </div>
+        <div class="result-item">
+          <div class="result-label">주당 근로시간 설명</div>
+          <div class="result-value" id="weeklyHoursHintText">
             주휴수당 지급 요건 참고: 주당 15시간 이상 근무 시 지급
           </div>
         </div>
 
         <div class="result-item">
-          <div class="result-label">방학중 근무수당 (조리종사원)</div>
+          <div class="result-label">방학중 근무수당 (조리종사원) 1일 기준</div>
           <div class="result-value" id="restPerDayText">-</div>
-          <div class="result-sub" id="restRuleText">
+        </div>
+        <div class="result-item">
+          <div class="result-label">방학중 근무수당 합계 (조리종사원)</div>
+          <div class="result-value" id="restTotalText">-</div>
+        </div>
+        <div class="result-item">
+          <div class="result-label">방학중 근무수당 산정 기준 설명</div>
+          <div class="result-value" id="restRuleText">
             4시간 이하 1만원, 4시간 초과 2만원
           </div>
         </div>
 
         <div class="result-item">
-          <div class="result-label">방학중 근무수당 합계 (조리종사원)</div>
-          <div class="result-value" id="restTotalText">-</div>
-        </div>
-
-        <div class="result-item">
           <div class="result-label">월간 유급 주휴일수 (조리종사원)</div>
           <div class="result-value" id="holidayDaysText">-</div>
-          <div class="result-sub" id="holidayCondText">
+        </div>
+        <div class="result-item">
+          <div class="result-label">주휴수당 요건 설명</div>
+          <div class="result-value" id="holidayCondText">
             주휴수당 지급 요건 참고용
           </div>
         </div>
 
         <div class="result-item">
-          <div class="result-label">주휴수당 일할계산 (조리종사원)</div>
+          <div class="result-label">주휴수당 1일 기준액 (조리종사원)</div>
           <div class="result-value" id="holidayPerDayText">-</div>
-          <div class="result-sub" id="holidayHintText">
+        </div>
+        <div class="result-item">
+          <div class="result-label">주휴수당 산정 기준 설명</div>
+          <div class="result-value" id="holidayHintText">
             여러달 걸쳐있으면 월별 주휴수당 각각 산출 결과 보여드림
           </div>
         </div>
@@ -180,13 +225,16 @@
         <div class="result-item">
           <div class="result-label">일할계산 인건비 (청소원)</div>
           <div class="result-value" id="prorataText">-</div>
-          <div class="result-sub" id="prorataHintText">
+        </div>
+        <div class="result-item">
+          <div class="result-label">청소원 인건비 산정 기준 설명</div>
+          <div class="result-value" id="prorataHintText">
             특수운영직군 청소원 선택 시에만 여기에 나옴
           </div>
         </div>
 
         <div class="result-item result-item-wide">
-          <div class="result-label strong">총 인건비</div>
+          <div class="result-label">총 인건비</div>
           <div class="result-total" id="grandTotalText">-</div>
         </div>
       </div>
