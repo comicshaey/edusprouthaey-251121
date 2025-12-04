@@ -1,469 +1,401 @@
-from __future__ import annotations
+# ============================================================
+# annual_engine.py
+# Pyodide / Python3.11 기준 완전 호환 모듈
+# - 나이스 근무상황 자동 집계
+# - 연차 추천 계산(규정 세트별 로직)
+# - 임금 계산(시급/일급/월급)
+# - 미사용 연차수당 산정
+# - 10원 단위 절사 규칙 포함
+# ============================================================
 
-from dataclasses import dataclass, asdict
-from typing import Any, Dict, List
+from dataclasses import dataclass
+from typing import List, Dict, Any, Optional
 
 
 # ============================================================
-# 0. 공통 도메인 모델
+# 0. 유틸
 # ============================================================
 
-@dataclass
-class RuleProfile:
-    """규정 세트 메타 정보.
-    - id: 내부용 키
-    - name: 화면 표시용 이름
-    - grant_type: 연차 부여 로직 구분용 키
-    - rounding_step: 금액 절사 단위 (예: 10원, 100원 등)
-    - rounding_mode: floor / round / ceil / none
-    - description: 규정 세트 설명
+def drop_to_10won(amount: float) -> int:
     """
-    id: str
-    name: str
-    grant_type: str
-    rounding_step: int = 10        # 기본: 10원 단위
-    rounding_mode: str = "floor"   # 기본: 버림
-    description: str = ""
-
-
-# 규정 세트 정의
-RULES: Dict[str, RuleProfile] = {
-    "law_basic": RuleProfile(
-        id="law_basic",
-        name="법정 기본형 (근로기준법 단순)",
-        grant_type="law_basic",
-        rounding_step=10,
-        rounding_mode="floor",
-        description="근로기준법을 단순화한 기본형 예시입니다."
-    ),
-    "gw_school_cba": RuleProfile(
-        id="gw_school_cba",
-        name="학교근무자 CBA 예시",
-        grant_type="gw_cba_like",
-        rounding_step=10,
-        rounding_mode="floor",
-        description="강원 교육공무직(학교근무자) 단체협약을 흉내낸 예시입니다. 실제 조항은 협약 원문을 확인해야 합니다."
-    ),
-    "gw_institute_cba": RuleProfile(
-        id="gw_institute_cba",
-        name="기관근무자 CBA 예시",
-        grant_type="gw_cba_like",
-        rounding_step=10,
-        rounding_mode="floor",
-        description="기관근무자 CBA 느낌의 예시입니다. 실제 규정은 원문을 기준으로 수정해야 합니다."
-    ),
-    "gw_wage_guideline": RuleProfile(
-        id="gw_wage_guideline",
-        name="통상임금 지침형 (연차일수 외부 산정)",
-        grant_type="manual_days",
-        rounding_step=10,
-        rounding_mode="floor",
-        description="연차일수는 외부에서 별도 산정하고, 여기서는 수당계산만 하는 모드입니다."
-    ),
-    "custom": RuleProfile(
-        id="custom",
-        name="커스텀 (연차·절사 규칙 수동)",
-        grant_type="manual_days",
-        rounding_step=10,
-        rounding_mode="floor",
-        description="연차일수와 절사 규칙을 사용자가 직접 관리하는 모드입니다."
-    ),
-}
-
-
-def get_rule(rule_id: str) -> RuleProfile:
-    """ID로 규정 세트를 가져오되, 없으면 law_basic으로 fallback."""
-    return RULES.get(rule_id, RULES["law_basic"])
+    1원 단위 절삭 기능 → 10원 단위로 내림.
+    예: 11111 → 11110 / 14567 → 14560
+    """
+    try:
+        return (int(amount) // 10) * 10
+    except Exception:
+        return 0
 
 
 # ============================================================
-# 1. 나이스 근무상황목록 파싱용 모델
+# 1. 나이스 근무상황 구조체
 # ============================================================
 
 @dataclass
 class NiceRecord:
-    """나이스 근무상황목록 한 행을 파싱하기 위한 최소 구조.
-    - leave_type: 종별(연가, 병가, 공가 등)
-    - duration_raw: '일수/기간' 열 문자열 (예: '0일 6시간 30분', '6:30', '1.5일')
-    - hours_per_day: 1일 소정근로시간 (소수 허용)
-    """
-    leave_type: str
-    duration_raw: str
-    hours_per_day: float = 8.0
+    leave_type: str        # 종별
+    duration_raw: str      # "1일5시간" 또는 "0.5" 등
+    hours_per_day: float   # 1일 소정근로시간(예: 8)
 
-    def to_minutes(self) -> int:
-        """duration_raw를 분 단위 정수로 변환.
-        다양한 표현을 최대한 수용하고, 해석 실패 시 0분으로 처리한다.
-        지원 패턴 예:
-          - '0일 6시간 30분'
-          - '6시간 30분'
-          - '6시간'
-          - '1일 0시간'
-          - '1일'
-          - '1.5일'
-          - '6:30' 또는 '06:30'
+    def parse_duration(self) -> Dict[str, Any]:
         """
-        s = (self.duration_raw or "").strip()
-        if not s:
-            return 0
+        duration_raw → 일 / 시간 / 분 형태로 파싱.
+        가능한 입력 예:
+            "1일 5시간"
+            "2.5"
+            "3시간 30분"
+            "1일"
+            "5시간"
+            "30분"
+        """
+        txt = str(self.duration_raw).strip()
+        if not txt:
+            return {"days": 0, "hours": 0, "minutes": 0}
 
-        # 공백 제거 버전도 같이 활용
-        s_nospace = s.replace(" ", "")
+        # case1: "X일Y시간Z분"
+        days = hours = minutes = 0
 
-        days = 0.0
-        hours = 0.0
-        minutes = 0.0
-
-        # 1) "h:mm" 형태인지 먼저 확인 (일 단위 표기가 없을 때만)
-        if ":" in s_nospace and "일" not in s_nospace:
+        # 일 단위
+        if "일" in txt:
             try:
-                h_str, m_str = s_nospace.split(":", 1)
-                hours = float(h_str or "0")
-                minutes = float(m_str or "0")
-                return int(round(hours * 60 + minutes))
-            except Exception:
-                # 실패하면 아래 규칙 계속 진행
-                pass
-
-        # 2) "x일 y시간 z분" / "x일 y시간" / "y시간 z분" / "y시간" / "z분"
-        import re
-
-        # 일
-        m_day = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*일", s_nospace)
-        if m_day:
-            days = float(m_day.group(1))
-
-        # 시간
-        m_hour = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*시간", s_nospace)
-        if m_hour:
-            hours = float(m_hour.group(1))
-
-        # 분
-        m_min = re.search(r"([0-9]+)\s*분", s_nospace)
-        if m_min:
-            minutes = float(m_min.group(1))
-
-        if days or hours or minutes:
-            total_minutes = days * self.hours_per_day * 60 + hours * 60 + minutes
-            return int(round(total_minutes))
-
-        # 3) '1.5일'처럼 일만 있는 케이스
-        if s_nospace.endswith("일"):
-            num_str = s_nospace[:-1]
-            try:
-                days = float(num_str)
-                total_minutes = days * self.hours_per_day * 60
-                return int(round(total_minutes))
+                val = txt.split("일")[0]
+                days = float(val)
+                txt = txt.split("일")[1]
             except Exception:
                 pass
 
-        # 4) 순수 숫자만 들어온 경우: "2" → 2일로 가정
-        if s_nospace.isdigit():
+        # 시간 단위
+        if "시간" in txt:
             try:
-                days = float(s_nospace)
-                total_minutes = days * self.hours_per_day * 60
-                return int(round(total_minutes))
+                val = txt.split("시간")[0]
+                hours = float(val)
+                txt = txt.split("시간")[1]
             except Exception:
                 pass
 
-        # 인식 실패
-        return 0
+        # 분 단위
+        if "분" in txt:
+            try:
+                val = txt.split("분")[0]
+                minutes = float(val)
+            except Exception:
+                pass
 
+        # case2: 순수 숫자 (0.5일 or 2.25일 등)
+        if days == 0 and hours == 0 and minutes == 0:
+            try:
+                # "2.5" → 2.5일
+                val = float(self.duration_raw)
+                days = val
+            except Exception:
+                pass
+
+        return {"days": days, "hours": hours, "minutes": minutes}
+
+    def to_total_hours(self) -> float:
+        """
+        총 시간을 10진법 시간으로 계산. (1일 = hours_per_day)
+        """
+        d = self.parse_duration()
+        total = d["days"] * self.hours_per_day
+        total += d["hours"]
+        total += d["minutes"] / 60.0
+        return total
+
+
+# ============================================================
+# 2. 나이스 근무상황 집계
+# ============================================================
 
 def summarize_nice_records(records: List[NiceRecord]) -> List[Dict[str, Any]]:
-    """NiceRecord 리스트를 종별(leave_type)별로 합산.
-    반환값은 JS에서 바로 쓰기 좋은 dict 리스트 형태.
-    각 항목:
-      - leave_type
-      - count
-      - sum_d_h_m: '0일 6시간 30분' 형식
-      - sum_hours_decimal: 10진법 시간(h)
-      - converted_days_hours: 'X일 Y.Y시간' (1일 소정근로시간 기준)
     """
-    from collections import defaultdict
+    같은 leave_type(종별)끼리 건수 및 합계 계산.
+    리턴 예:
+    [
+      {
+        "leave_type": "병가",
+        "count": 3,
+        "sum_d_h_m": "2일 3시간",
+        "sum_hours_decimal": 19.5,
+        "converted_days_hours": "2일 3.5시간"
+      },
+      ...
+    ]
+    """
+    if not records:
+        return []
 
-    grouped_minutes: Dict[str, int] = defaultdict(int)
-    grouped_count: Dict[str, int] = defaultdict(int)
-    hours_per_day = 8.0
+    grouped = {}
+    for r in records:
+        lt = r.leave_type
+        grouped.setdefault(lt, []).append(r)
 
-    for rec in records:
-        minutes = rec.to_minutes()
-        grouped_minutes[rec.leave_type] += minutes
-        grouped_count[rec.leave_type] += 1
-        # hours_per_day는 모두 동일하다고 가정하고 마지막 값 사용
-        hours_per_day = rec.hours_per_day or hours_per_day
+    output = []
+    for lt, recs in grouped.items():
+        total_hours = 0.0
 
-    results: List[Dict[str, Any]] = []
-    for leave_type, total_min in grouped_minutes.items():
-        cnt = grouped_count[leave_type]
+        for r in recs:
+            total_hours += r.to_total_hours()
 
-        # 전체 시간(분) → 일/시/분
-        total_hours = total_min / 60.0
-        total_days = int(total_hours // hours_per_day)
-        remain_hours = total_hours - total_days * hours_per_day
-        h_part = int(remain_hours)
-        m_part = int(round((remain_hours - h_part) * 60))
+        # 총시간 → 일·시간·분 변환
+        hpd = recs[0].hours_per_day
+        days = int(total_hours // hpd)
+        remain = total_hours - days * hpd
+        hours = int(remain)
+        minutes = int(round((remain - hours) * 60))
 
-        sum_d_h_m = f"{total_days}일 {h_part}시간 {m_part}분"
+        # 보기용 문자열
+        dhm_str = f"{days}일 {hours}시간 {minutes}분"
+        # 10진법 환산: remain은 순수시간
+        converted = f"{days}일 {round(remain, 1)}시간"
 
-        # 10진법 시간
-        sum_hours_decimal = round(total_hours, 1)
+        output.append({
+          "leave_type": lt,
+          "count": len(recs),
+          "sum_d_h_m": dhm_str,
+          "sum_hours_decimal": round(total_hours, 1),
+          "converted_days_hours": converted
+        })
 
-        # 1일 소정근로시간 기준 일+시간 환산
-        conv_days = total_hours / hours_per_day if hours_per_day > 0 else 0.0
-        days_int = int(conv_days)
-        remain_hours_dec = round((conv_days - days_int) * hours_per_day, 1)
-        converted_days_hours = f"{days_int}일 {remain_hours_dec}시간"
+    return output
 
-        results.append(
-            {
-                "leave_type": leave_type,
-                "count": cnt,
-                "sum_d_h_m": sum_d_h_m,
-                "sum_hours_decimal": sum_hours_decimal,
-                "converted_days_hours": converted_days_hours,
+
+# ============================================================
+# 3. 연차 규정 세트 정의
+# ============================================================
+
+@dataclass
+class RuleProfile:
+    id: str
+    name: str
+    rounding_step: int = 10   # 10원단위 절사
+    rounding_mode: str = "floor"  # 일단 버림
+    base_days: Dict[str, Any] = None
+
+
+# 규정 테이블(샘플 + 확장 가능)
+RULE_PROFILES = {
+    "law_basic": RuleProfile(
+        id="law_basic",
+        name="법정 기본형",
+    ),
+    "gw_school_cba": RuleProfile(
+        id="gw_school_cba",
+        name="학교근무자 CBA (예시)"
+    ),
+    "gw_institute_cba": RuleProfile(
+        id="gw_institute_cba",
+        name="기관근무자 CBA (예시)"
+    ),
+    "gw_wage_guideline": RuleProfile(
+        id="gw_wage_guideline",
+        name="통상임금 지침형 (예시)"
+    ),
+    "custom": RuleProfile(
+        id="custom",
+        name="커스텀"
+    ),
+}
+
+
+# ============================================================
+# 4. 연차 추천 로직
+# ============================================================
+
+def suggest_annual_days(rule_id: str, svc: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    규정별 연차 “추천” 계산.
+    svc = {
+        service_years, full_years, attendance_rate, full_months ...
+    }
+    """
+    fy = svc.get("full_years", 0)
+    rate = svc.get("attendance_rate", 0)
+    fm = svc.get("full_months", 0)
+
+    # -------------------------
+    # A) 법정 기본형
+    # -------------------------
+    if rule_id == "law_basic":
+        if fy < 1:
+            # 1년 미만 → 월개근 수 = 연차일수 (최대 11일)
+            days = min(fm, 11)
+            return {
+                "suggested_days": days,
+                "description": f"법정기본형: 1년 미만 → 월개근 {fm}개월 → {days}일"
             }
-        )
+        else:
+            # 1년 이상
+            if rate < 80:
+                # 출근율 <80 → 월 개근수 = 연차일수
+                days = fm
+                return {
+                    "suggested_days": days,
+                    "description": f"법정기본형: 출근율 {rate}% < 80 → 월개근 {fm} → {days}일"
+                }
+            else:
+                # 출근율 ≥80: 15 + 가산
+                extra = max(0, min(10, (fy - 1) // 2))
+                days = 15 + extra
+                return {
+                    "suggested_days": days,
+                    "description": f"법정기본형: 근속 {fy}년 → 기본 15 + 가산 {extra} = {days}일"
+                }
 
-    # 종별 이름 기준 정렬
-    results.sort(key=lambda x: str(x["leave_type"]))
-    return results
+    # -------------------------
+    # B) 학교근무자 CBA (예시)
+    # -------------------------
+    if rule_id == "gw_school_cba":
+        if fy < 1:
+            days = min(fm, 11)
+            return {
+                "suggested_days": days,
+                "description": f"학교 CBA: 1년 미만 → {fm}개월 → {days}일"
+            }
+        else:
+            if rate >= 80:
+                days = 26
+                return {
+                    "suggested_days": days,
+                    "description": f"학교 CBA: 출근율 {rate}% ≥80 → {days}일"
+                }
+            else:
+                days = fm
+                return {
+                    "suggested_days": days,
+                    "description": f"학교 CBA: 출근율 {rate}% <80 → {days}일"
+                }
 
+    # -------------------------
+    # C) 기관근무자 CBA (예시)
+    # -------------------------
+    if rule_id == "gw_institute_cba":
+        if fy < 1:
+            days = min(fm, 11)
+            return {
+                "suggested_days": days,
+                "description": f"기관 CBA: 1년 미만 → {fm}개월 → {days}일"
+            }
+        else:
+            if rate >= 80:
+                days = 25
+                return {
+                    "suggested_days": days,
+                    "description": f"기관 CBA: 출근율 {rate}% ≥80 → {days}일"
+                }
+            else:
+                days = fm
+                return {
+                    "suggested_days": days,
+                    "description": f"기관 CBA: 출근율 {rate}% <80 → {days}일"
+                }
 
-# ============================================================
-# 2. 연차일수 추천 로직
-# ============================================================
+    # -------------------------
+    # D) 통상임금 지침형 (예시)
+    # -------------------------
+    if rule_id == "gw_wage_guideline":
+        if fy < 1:
+            days = min(fm, 11)
+            return {
+                "suggested_days": days,
+                "description": f"지침형: 1년 미만 → {fm} → {days}일"
+            }
+        else:
+            days = 26
+            return {
+                "suggested_days": days,
+                "description": f"지침형: 근속 {fy}년 → {days}일"
+            }
 
-def _get_float(info: Dict[str, Any], key: str, default: float = 0.0) -> float:
-    try:
-        v = info.get(key, default)
-        if v is None:
-            return default
-        return float(v)
-    except Exception:
-        return default
-
-
-def _get_int(info: Dict[str, Any], key: str, default: int = 0) -> int:
-    try:
-        v = info.get(key, default)
-        if v is None:
-            return default
-        return int(v)
-    except Exception:
-        return default
-
-
-def suggest_annual_days(rule_id: str, service_info: Dict[str, Any]) -> Dict[str, Any]:
-    """규정 세트(rule_id)와 근속·출근 요약(service_info)를 받아
-    추천 연차일수와 설명을 반환한다.
-    """
-    rule = get_rule(rule_id)
-    full_years = _get_int(service_info, "full_years", 0)
-    attendance_rate = _get_float(service_info, "attendance_rate", 0.0)
-    full_months = _get_int(service_info, "full_months", 0)
-
-    # manual_days 계열은 추천값 없이 안내만
-    if rule.grant_type == "manual_days":
-        return {
-            "suggested_days": None,
-            "description": "연차일수는 외부 또는 지침에 따라 별도 산정하는 모드입니다. 부여 연차일수를 직접 입력하세요.",
-        }
-
-    # 법정 기본형
-    if rule.grant_type == "law_basic":
-        if full_years < 1:
-            sug = min(full_months, 11)
-            desc = f"법정 기본형: 1년 미만 근로, 월 개근 {full_months}개월 → {sug}일 (예시: 최대 11일)"
-            return {"suggested_days": sug, "description": desc}
-
-        if attendance_rate < 80:
-            sug = full_months
-            desc = (
-                f"법정 기본형: 출근율 {attendance_rate:.1f}% (80% 미만) → "
-                f"월 개근 {full_months}개월 = {sug}일로 단순 계산"
-            )
-            return {"suggested_days": sug, "description": desc}
-
-        extra = max(0, min(10, (full_years - 1) // 2))
-        sug = 15 + extra
-        desc = (
-            f"법정 기본형: 근속 {full_years}년 / 출근율 {attendance_rate:.1f}% → "
-            f"기본 15일 + 가산 {extra}일 = {sug}일 (예시)"
-        )
-        return {"suggested_days": sug, "description": desc}
-
-    # 강원 CBA 느낌
-    if rule.grant_type == "gw_cba_like":
-        if full_years < 1:
-            sug = min(full_months, 11)
-            desc = (
-                f"강원 CBA 샘플: 1년 미만, 월 개근 {full_months}개월 → "
-                f"{sug}일 (최대 11일 예시)"
-            )
-            return {"suggested_days": sug, "description": desc}
-
-        if attendance_rate >= 80:
-            sug = 26  # 실제 단협 값으로 교체 가능
-            desc = (
-                f"강원 CBA 샘플: 근속 {full_years}년 / 출근율 {attendance_rate:.1f}% → "
-                f"{sug}일 (샘플 값)"
-            )
-            return {"suggested_days": sug, "description": desc}
-
-        sug = full_months
-        desc = (
-            f"강원 CBA 샘플: 출근율 {attendance_rate:.1f}% (80% 미만) → "
-            f"월 개근 {full_months}개월 = {sug}일로 단순 적용"
-        )
-        return {"suggested_days": sug, "description": desc}
-
-    # 기타
+    # -------------------------
+    # E) 커스텀
+    # -------------------------
     return {
         "suggested_days": None,
-        "description": "이 규정 세트는 별도 로직이 설정되지 않았습니다. 부여 연차일수를 직접 입력하세요.",
+        "description": "커스텀 모드: 직접 입력"
     }
 
 
 # ============================================================
-# 3. 임금 / 미사용 연차수당 계산
+# 5. 1일 통상임금 계산
 # ============================================================
 
-def calc_daily_wage(wage_info: Dict[str, Any]) -> float:
-    """임금형태에 따라 1일 통상임금을 계산한다."""
-    wage_type = str(wage_info.get("wage_type", "monthly") or "monthly")
-    wage_amount = _get_float(wage_info, "wage_amount", 0.0)
-    hours_per_day = _get_float(wage_info, "hours_per_day", 0.0)
-    monthly_work_days = _get_float(wage_info, "monthly_work_days", 0.0)
-
-    if wage_amount <= 0:
-        return 0.0
-
-    if wage_type == "hourly":
-        if hours_per_day <= 0:
-            return 0.0
-        return wage_amount * hours_per_day
-
-    if wage_type == "daily":
-        return wage_amount
-
-    # monthly
-    if monthly_work_days <= 0:
-        return 0.0
-    return wage_amount / monthly_work_days
-
-
-def apply_rounding(amount: float, rule: RuleProfile) -> float:
-    """규정 세트 rounding_step/mode 적용 후,
-    추가로 1원 단위 절삭(10원 단위 버림)을 공통 적용한다.
+def calc_daily_wage(wage: Dict[str, Any]) -> float:
     """
-    if amount is None:
-        return 0.0
-
-    step = rule.rounding_step or 1
-    mode = (rule.rounding_mode or "none").lower()
-
-    # 규정 세트 기준 1차 처리
-    if step <= 1 or mode == "none":
-        rounded = float(amount)
-    else:
-        base = float(amount) / step
-        if mode == "floor":
-            import math
-            base = math.floor(base)
-        elif mode == "round":
-            base = round(base)
-        elif mode == "ceil":
-            import math
-            base = math.ceil(base)
-        rounded = base * step
-
-    # 2차: 공통 정책 1원 절삭(10원 단위 버림)
-    rounded = float(rounded)
-    if rounded <= 0:
-        return 0.0
-    return (int(rounded) // 10) * 10
-
-
-def calc_unused_payout(
-    rule_id: str,
-    wage_info: Dict[str, Any],
-    granted_days: float,
-    used_days: float,
-) -> Dict[str, Any]:
-    """부여/사용 연차일수와 임금 정보를 받아
-    미사용 연차수당(원단위/절사 적용)을 계산한다."""
-    rule = get_rule(rule_id)
-
-    try:
-        g = float(granted_days or 0.0)
-    except Exception:
-        g = 0.0
-
-    try:
-        u = float(used_days or 0.0)
-    except Exception:
-        u = 0.0
-
-    unused = g - u
-    if unused < 0:
-        unused = 0.0
-
-    daily_wage_raw = calc_daily_wage(wage_info)
-    payout_raw = daily_wage_raw * unused
-    payout_rounded = apply_rounding(payout_raw, rule)
-
-    return {
-        "granted_days": g,
-        "used_days": u,
-        "unused_days": unused,
-        "daily_wage_raw": daily_wage_raw,
-        "payout_raw": payout_raw,
-        "payout_rounded": payout_rounded,
-        "rounding_step": rule.rounding_step,
-        "rounding_mode": rule.rounding_mode,
+    wage = {
+      wage_type: hourly/daily/monthly
+      wage_amount,
+      hours_per_day,
+      monthly_work_days
     }
-
-
-# ============================================================
-# 4. 전체 파이프라인
-# ============================================================
-
-def full_pipeline(
-    rule_id: str,
-    service_info: Dict[str, Any],
-    wage_info: Dict[str, Any],
-    granted_days: float,
-    used_days: float,
-) -> Dict[str, Any]:
-    """JS(Pyodide)에서 한 번에 부를 수 있게
-    - 규정 세트 메타
-    - 추천 연차일수
-    - 미사용 연차수당 계산 결과
-    를 통합해서 반환한다.
     """
-    rule = get_rule(rule_id)
+    wtype = wage.get("wage_type")
+    amt = wage.get("wage_amount", 0)
+    hpd = wage.get("hours_per_day", 8)
+    mwd = wage.get("monthly_work_days", 20)
 
-    suggestion = suggest_annual_days(rule_id, service_info)
+    if wtype == "hourly":
+        return amt * hpd
+    elif wtype == "daily":
+        return amt
+    elif wtype == "monthly":
+        if mwd > 0:
+            return amt / mwd
+        return 0
+    return 0
 
-    # 부여일수가 0 또는 미입력이고, 추천 값이 있으면 그걸 기본값으로 사용
-    try:
-        g_input = float(granted_days or 0.0)
-    except Exception:
-        g_input = 0.0
 
-    if g_input <= 0 and suggestion.get("suggested_days") is not None:
-        g_input = float(suggestion["suggested_days"] or 0.0)
+# ============================================================
+# 6. 전체 파이프라인
+# ============================================================
 
-    payout = calc_unused_payout(
-        rule_id=rule_id,
-        wage_info=wage_info,
-        granted_days=g_input,
-        used_days=used_days or 0.0,
-    )
+def full_pipeline(rule_id: str,
+                  svc: Dict[str, Any],
+                  wage: Dict[str, Any],
+                  granted_days: float,
+                  used_days: float) -> Dict[str, Any]:
+    """
+    HTML에서 호출하는 핵심 엔진.
+    반환 구조:
+    {
+        rule: {...},
+        suggestion: {...},
+        payout: {...}
+    }
+    """
+
+    # 1) 규정 세트 로딩
+    profile = RULE_PROFILES.get(rule_id, RULE_PROFILES["custom"])
+
+    # 2) 연차 추천
+    suggestion = suggest_annual_days(rule_id, svc)
+
+    # 3) 미사용 연차 산출
+    unused = max(granted_days - used_days, 0)
+
+    # 4) 1일 통상임금 계산
+    daily_raw = calc_daily_wage(wage)
+
+    # 5) 미사용수당 산정
+    payout_raw = unused * daily_raw
+
+    # 6) 10원단위 절사 적용
+    daily_cut = drop_to_10won(daily_raw)
+    payout_cut = drop_to_10won(payout_raw)
 
     return {
-        "rule": asdict(rule),
+        "rule": {
+            "id": profile.id,
+            "name": profile.name
+        },
         "suggestion": suggestion,
-        "payout": payout,
+        "payout": {
+            "granted_days": granted_days,
+            "used_days": used_days,
+            "unused_days": unused,
+            "daily_wage_raw": daily_raw,
+            "payout_raw": payout_raw,
+            "daily_wage_rounded": daily_cut,
+            "payout_rounded": payout_cut
+        }
     }
